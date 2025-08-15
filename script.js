@@ -25,7 +25,8 @@ loader.load(
     'Untitled.glb',
     function (gltf) {
         model = gltf.scene;
-        model.scale.set(0.3, 0.3, 0.3); // Уменьшаем модель до 50%
+        model.scale.set(0.2, 0.2, 0.2); // Уменьшаем модель
+        model.rotation.y = Math.PI;
         scene.add(model);
 
         // Center the model
