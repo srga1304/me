@@ -73,6 +73,12 @@ img {
     animation: glitchBorder 4s infinite alternate;
 }
 
+.model canvas {
+    width: 100% !important;
+    height: 100% !important;
+    display: block;
+}
+
 .links {
     display: flex;
     justify-content: center;
