@@ -231,3 +231,30 @@ img {
             7px 7px 0 7px #cccccc;
     }
 }
+
+#akaToggle {
+  cursor: pointer;
+}
+
+.hidden-aka {
+  display: none;
+}
+
+.hover-aka {
+  display: none;
+}
+
+.hover-trigger:hover + .hover-aka {
+  display: block;
+}
+
+.aka-pavel-kaimakov-text {
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.3s ease-in-out;
+}
+
+.aka-pavel-kaimakov-text.is-visible {
+  visibility: visible;
+  opacity: 1;
+}

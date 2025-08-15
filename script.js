@@ -68,3 +68,35 @@ window.addEventListener('resize', () => {
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
 });
+
+const AKA_REVEAL_THRESHOLD = 5;
+
+function setupAkaToggle() {
+  const akaToggle = document.getElementById('akaToggle');
+  const moreAka = document.getElementById('moreAka');
+  const akaPavelKaimakovText = moreAka ? moreAka.querySelector('.aka-pavel-kaimakov-text') : null;
+  let akaOpenCount = 0;
+
+  if (akaToggle && moreAka) {
+    akaToggle.addEventListener('click', () => {
+      moreAka.classList.toggle('hidden-aka');
+
+      if (!moreAka.classList.contains('hidden-aka')) {
+        // moreAka is now visible
+        akaOpenCount++;
+        if (akaOpenCount >= AKA_REVEAL_THRESHOLD && akaPavelKaimakovText) {
+          akaPavelKaimakovText.classList.add('is-visible');
+        }
+      } else {
+        // moreAka is now hidden, ensure akaPavelKaimakovText is hidden too
+        if (akaPavelKaimakovText) {
+          akaPavelKaimakovText.classList.remove('is-visible');
+        }
+      }
+    });
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  setupAkaToggle();
+});
