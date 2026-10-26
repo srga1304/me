@@ -3,28 +3,39 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 // The robot head from EMT-01 Assembly Simulator, exported from the game's scene.
-// Its parts fly in from the four sides of the frame in the game's build order,
-// hold together for a while (eyes follow the cursor), then fly apart again.
+// It turns all the time. First the frame is empty, then the parts arrive one by
+// one, each whole, in the game's build order, from the four sides of the frame.
+// Whole, it wakes: the lids open, it blinks, the eyes follow the cursor. Then it
+// shuts its eyes and comes apart, last part first.
 
 const MODEL_URL = 'robot_head.glb';
-// Build order in the game (data/parts.json). "Ears" is exported as "Ears5".
-const PART_ORDER = ['Skull', 'Mouth', 'Teeth', 'Ears', 'EyeFrame', 'Eyes', 'Face'];
-// Containers whose children fly one by one instead of as a single block.
-const SPLIT_NODES = ['Motors'];
+// Build order in the game (data/parts.json) and the side each part comes from.
+// "Ears" is exported as "Ears5".
+const PARTS = [
+    { name: 'Skull', side: [0, -1] },
+    { name: 'Mouth', side: [-1, 0] },
+    { name: 'Teeth', side: [1, 0] },
+    { name: 'Ears', side: [0, 1] },
+    { name: 'EyeFrame', side: [-1, 0] },
+    { name: 'Eyes', side: [1, 0] },
+    { name: 'Face', side: [0, 1] },
+];
 
 const PIXEL_SIZE = 2;          // one rendered pixel = 2 css pixels
-const PART_GAP = 0.55;         // s between the starts of two parts
-const PIECE_SPREAD = 0.5;      // s of random delay inside one part
-const FLY_IN = 0.75;           // s for one piece to land
-const FLY_OUT = 0.6;           // s for one piece to leave
-const HOLD = 5.5;              // s the head stays whole
-const EMPTY = 0.8;             // s of empty frame before the next build
-const OUT_GAP = 0.25;          // s between parts while flying apart
-const BASE_YAW = -0.35;        // a three-quarter view reads the depth
-// Lid angles from the game's face_rig.gd (degrees about X).
-const LID_CLOSED = 80, LID_OPEN = -70;   // the lower lids stay as they are
-const WAKE = 0.6;              // s for the lids to open once the head is whole
+const EMPTY = 1.5;             // s of empty frame before the skull comes
+const FLY_IN = 1.6;            // s for one part to land
+const SETTLE = 0.5;            // s between one part landing and the next leaving the edge
+const HOLD = 7;                // s the head stays whole
+const FLY_OUT = 1.0;           // s for one part to leave
+const OUT_GAP = 0.45;          // s between parts while it comes apart
+const TURN_PERIOD = 9;         // s per turn, roughly: the head never stops turning
+const TILT = 0.12;             // rad, a slight look from above
+const TUMBLE = 0.6;            // rad, how askew a part is while it flies
+// Lid angles from the game's face_rig.gd (degrees about X); the lower lids stay as they are.
+const LID_CLOSED = 80, LID_OPEN = -70;
+const WAKE = 0.8;              // s for the lids to open once the head is whole
 const BLINK = 0.16;            // s one blink takes
+const EYE_MAX = 0.6;           // rad, how far the eyes turn in their sockets
 
 const container = document.querySelector('.model');
 const canvas = document.getElementById('modelCanvas');
@@ -65,42 +76,22 @@ function addVertexSnap(material) {
 const pivot = new THREE.Group();   // turns the head; centred on it
 scene.add(pivot);
 
-let pieces = [];
-let eyes = [];
-let lids = [];                 // upper lid pieces
-let nextBlink = 0;
+let parts = [];                // { obj, restPos, restQuat, side, tumble, inAt, outAt }
+let eyes = [];                 // { obj, rest }
+let lids = [];                 // { obj }
+let offFrame = 1;
+let assembleEnd = 0, holdEnd = 0, cycleEnd = 0;
 let cycleStart = 0;
-let assembleEnd = 0;
-let disassembleLen = 0;
+let turnsPerCycle = 1;
 let skipHold = false;
-const pointer = new THREE.Vector2(0, 0);   // -1..1 over the page
+let nextBlink = 0;
+const pointer = new THREE.Vector2(0, 0);   // -1..1 around the head
 
 const ease = {
-    outBack: (t) => { const c = 1.4; const u = t - 1; return 1 + (c + 1) * u * u * u + c * u * u; },
+    outBack: (t) => { const c = 0.8; const u = t - 1; return 1 + (c + 1) * u * u * u + c * u * u; },
     inCubic: (t) => t * t * t,
+    smooth: (t) => { t = Math.min(Math.max(t, 0), 1); return t * t * (3 - 2 * t); },
 };
-
-function sideOf(center, fallback) {
-    // The side of the frame nearest to where the piece sits on the head.
-    const ax = Math.abs(center.x), ay = Math.abs(center.y);
-    if (Math.max(ax, ay) < 0.025) return fallback;
-    if (ax > ay) return new THREE.Vector3(Math.sign(center.x), 0, 0);
-    return new THREE.Vector3(0, Math.sign(center.y), 0);
-}
-
-const SIDES = [
-    new THREE.Vector3(0, -1, 0), new THREE.Vector3(1, 0, 0),
-    new THREE.Vector3(0, 1, 0), new THREE.Vector3(-1, 0, 0),
-];
-
-function collectPieces(part) {
-    const out = [];
-    for (const child of part.children) {
-        if (SPLIT_NODES.some((n) => child.name.startsWith(n))) out.push(...child.children);
-        else out.push(child);
-    }
-    return out;
-}
 
 function setup(gltf) {
     const head = gltf.scene;
@@ -113,144 +104,110 @@ function setup(gltf) {
 
     // Centre the head on the pivot.
     const box = new THREE.Box3().setFromObject(head);
-    const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
-    head.position.sub(center);
+    head.position.sub(box.getCenter(new THREE.Vector3()));
     pivot.add(head);
-    pivot.updateMatrixWorld(true);
 
-    const radius = Math.max(size.x, size.y) * 0.5;
-    const dist = radius / Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * 1.25;
+    // Turning, the head sweeps a circle: fit that, not the front view.
+    const radius = Math.max(Math.hypot(size.x, size.z), size.y) * 0.5;
+    const dist = radius / Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * 1.1;
     camera.position.set(0, 0, dist);
     camera.lookAt(0, 0, 0);
-    // How far a piece starts: well past the frame edge at the head's depth.
-    const offFrame = radius * 3.2;
+    offFrame = radius * 3;     // well past the frame edge at the head's depth
 
-    const root = head.children.length === 1 && !PART_ORDER.some((p) => head.name.startsWith(p))
-        ? head.children[0] : head;
-    const parts = PART_ORDER
-        .map((name) => root.children.find((c) => c.name.startsWith(name)))
-        .filter(Boolean);
-
-    let t = 0;
-    parts.forEach((part, partIndex) => {
-        const fallback = SIDES[partIndex % SIDES.length];
-        for (const obj of collectPieces(part)) {
-            const b = new THREE.Box3().setFromObject(obj);
-            if (b.isEmpty()) continue;
-            const c = b.getCenter(new THREE.Vector3());
-            const side = sideOf(c, fallback);
-            const worldPos = obj.getWorldPosition(new THREE.Vector3());
-            const startWorld = worldPos.clone()
-                .addScaledVector(side, offFrame * (1 + Math.random() * 0.4))
-                .add(new THREE.Vector3(
-                    side.x === 0 ? (Math.random() - 0.5) * radius : 0,
-                    side.y === 0 ? (Math.random() - 0.5) * radius : 0,
-                    (Math.random() - 0.5) * radius));
-            const restPos = obj.position.clone();
-            const startPos = obj.parent.worldToLocal(startWorld.clone());
-            const restQuat = obj.quaternion.clone();
-            const spin = new THREE.Quaternion().setFromEuler(new THREE.Euler(
-                (Math.random() - 0.5) * 4, (Math.random() - 0.5) * 4, (Math.random() - 0.5) * 4));
-            pieces.push({
-                obj, restPos, startPos, restQuat,
-                startQuat: restQuat.clone().multiply(spin),
-                partIndex,
-                inAt: partIndex * PART_GAP + Math.random() * PIECE_SPREAD,
-                outAt: (parts.length - 1 - partIndex) * OUT_GAP + Math.random() * PIECE_SPREAD * 0.6,
-            });
-        }
-        t = Math.max(t, partIndex * PART_GAP + PIECE_SPREAD + FLY_IN);
+    const root = head.getObjectByName('RobotHead') || head.children[0];
+    let t = EMPTY;
+    PARTS.forEach((p) => {
+        const obj = root.children.find((c) => c.name.startsWith(p.name));
+        if (!obj) return;
+        parts.push({
+            obj,
+            restPos: obj.position.clone(),
+            restQuat: obj.quaternion.clone(),
+            side: new THREE.Vector3(p.side[0], p.side[1], 0),
+            tumble: new THREE.Euler(
+                (Math.random() - 0.5) * TUMBLE, (Math.random() - 0.5) * TUMBLE, (Math.random() - 0.5) * TUMBLE),
+            inAt: t,
+        });
+        t += FLY_IN + SETTLE;
     });
     assembleEnd = t;
-    disassembleLen = (parts.length - 1) * OUT_GAP + PIECE_SPREAD * 0.6 + FLY_OUT;
+    holdEnd = assembleEnd + HOLD;
+    parts.slice().reverse().forEach((p, i) => { p.outAt = holdEnd + i * OUT_GAP; });
+    cycleEnd = holdEnd + (parts.length - 1) * OUT_GAP + FLY_OUT;
+    // A whole number of turns per cycle, so the loop is seamless and the face
+    // looks at you each time it wakes.
+    turnsPerCycle = Math.max(1, Math.round(cycleEnd / TURN_PERIOD));
 
-    const eyesNode = root.children.find((c) => c.name.startsWith('Eyes'));
-    if (eyesNode) {
-        eyes = eyesNode.children
-            .filter((c) => /^Eye[LR]/.test(c.name))
-            .map((obj) => ({ obj, rest: obj.quaternion.clone() }));
-    }
-
-    for (const p of pieces) {
-        if (/^Lid[LR]/.test(p.obj.name)) lids.push(p);
-    }
+    root.traverse((o) => {
+        if (/^Eye[LR]$/.test(o.name)) eyes.push({ obj: o, rest: o.quaternion.clone() });
+        if (/^Lid[LR]$/.test(o.name)) lids.push({ obj: o });
+    });
 
     resize();
     cycleStart = performance.now() / 1000;
 }
 
+const tmpVec = new THREE.Vector3();
+const tmpQuat = new THREE.Quaternion();
+const invPivot = new THREE.Quaternion();
+
 function place(p, k) {
-    // k = 0 at the start position, 1 at rest.
-    p.obj.position.lerpVectors(p.startPos, p.restPos, k);
-    p.obj.quaternion.slerpQuaternions(p.startQuat, p.restQuat, Math.min(Math.max(k, 0), 1));
+    // k = 0 off the frame, 1 at rest. The side is on screen, so it is turned
+    // back by the head's own turn to get the offset in the head's space.
     p.obj.visible = k > 0.001;
+    if (!p.obj.visible) return;
+    invPivot.copy(pivot.quaternion).invert();
+    tmpVec.copy(p.side).applyQuaternion(invPivot).multiplyScalar(offFrame * (1 - k));
+    p.obj.position.copy(p.restPos).add(tmpVec);
+    tmpQuat.setFromEuler(p.tumble).slerp(new THREE.Quaternion(), Math.min(Math.max(k, 0), 1));
+    p.obj.quaternion.copy(p.restQuat).multiply(tmpQuat);
 }
 
 function updateCycle(now) {
     if (reduceMotion) {
-        for (const p of pieces) place(p, 1);
-        return true;
+        for (const p of parts) place(p, 1);
+        return 1;
     }
     let t = now - cycleStart;
-    const holdEnd = assembleEnd + HOLD;
     if (skipHold && t > assembleEnd && t < holdEnd) {
         cycleStart -= holdEnd - t;
         t = holdEnd;
     }
     skipHold = false;
-    const outEnd = holdEnd + disassembleLen;
-    if (t > outEnd + EMPTY) {
+    if (t > cycleEnd) {
         cycleStart = now;
         t = 0;
     }
-    for (const p of pieces) {
-        if (t < holdEnd) {
-            const k = Math.min(Math.max((t - p.inAt) / FLY_IN, 0), 1);
-            place(p, k === 0 ? 0 : ease.outBack(k));
-        } else {
-            const k = Math.min(Math.max((t - holdEnd - p.outAt) / FLY_OUT, 0), 1);
-            place(p, 1 - ease.inCubic(k));
-        }
+    for (const p of parts) {
+        if (t < holdEnd) place(p, t < p.inAt ? 0 : ease.outBack(Math.min((t - p.inAt) / FLY_IN, 1)));
+        else place(p, 1 - ease.inCubic(Math.min(Math.max((t - p.outAt) / FLY_OUT, 0), 1)));
     }
-    poseLids(t, holdEnd);
-    return t > assembleEnd && t < holdEnd;   // whole
+    // How awake it is: opens once whole, shuts just before it comes apart.
+    return ease.smooth((t - assembleEnd) / WAKE) * (1 - ease.smooth((t - holdEnd + WAKE) / WAKE));
 }
 
-const lidEuler = new THREE.Euler();
-function poseLids(t, holdEnd) {
-    // Shut while it is being built; it wakes once whole, blinks, shuts before it comes apart.
-    const smooth = (x) => { x = Math.min(Math.max(x, 0), 1); return x * x * (3 - 2 * x); };
-    let open = smooth((t - assembleEnd) / WAKE) * (1 - smooth((t - holdEnd + WAKE * 0.5) / (WAKE * 0.5)));
-    if (t < assembleEnd || t > holdEnd) nextBlink = t + 1.5 + Math.random() * 2;
+function poseFace(t, awake, dt) {
+    let open = awake;
+    if (awake < 1) nextBlink = t + 1.5 + Math.random() * 2;
     else if (t > nextBlink) {
         const b = (t - nextBlink) / BLINK;
         if (b > 1) nextBlink = t + 2 + Math.random() * 3;
         else open *= Math.abs(b * 2 - 1);
     }
-    for (const piece of lids) {
-        const deg = THREE.MathUtils.lerp(LID_CLOSED, LID_OPEN, open);
-        piece.restQuat.setFromEuler(lidEuler.set(THREE.MathUtils.degToRad(deg), 0, 0));
-        if (t > assembleEnd && t < holdEnd) piece.obj.quaternion.copy(piece.restQuat);
+    for (const l of lids) {
+        l.obj.rotation.set(THREE.MathUtils.degToRad(THREE.MathUtils.lerp(LID_CLOSED, LID_OPEN, open)), 0, 0);
     }
-}
-
-const lookQuat = new THREE.Quaternion();
-const lookEuler = new THREE.Euler();
-let yaw = BASE_YAW, pitch = 0;
-
-function updateLook(whole, dt) {
-    // The head turns a little toward the cursor; the eyes turn further.
-    const targetYaw = whole ? BASE_YAW * 0.4 + pointer.x * 0.45 : BASE_YAW;
-    const targetPitch = whole ? -pointer.y * 0.25 : 0;
-    const k = 1 - Math.exp(-dt * 3);
-    yaw += (targetYaw - yaw) * k;
-    pitch += (targetPitch - pitch) * k;
-    pivot.rotation.set(pitch, yaw, 0);
+    // The eyes look at a point in front of the frame where the cursor is.
+    const k = 1 - Math.exp(-dt * 6);
+    const target = new THREE.Vector3(pointer.x, -pointer.y, 0).multiplyScalar(offFrame * 0.5);
+    target.z = camera.position.z;
     for (const e of eyes) {
-        lookEuler.set(whole ? -pointer.y * 0.35 : 0, whole ? pointer.x * 0.5 : 0, 0);
-        lookQuat.setFromEuler(lookEuler);
-        e.obj.quaternion.slerp(e.rest.clone().multiply(lookQuat), k);
+        const local = e.obj.parent.worldToLocal(target.clone()).sub(e.obj.position).normalize();
+        const yawE = THREE.MathUtils.clamp(Math.atan2(local.x, local.z), -EYE_MAX, EYE_MAX);
+        const pitchE = THREE.MathUtils.clamp(-Math.asin(local.y), -EYE_MAX, EYE_MAX);
+        tmpQuat.setFromEuler(new THREE.Euler(pitchE * awake, yawE * awake, 0, 'YXZ'));
+        e.obj.quaternion.slerp(e.rest.clone().multiply(tmpQuat), k);
     }
 }
 
@@ -272,13 +229,18 @@ function animate() {
     const now = performance.now() / 1000;
     const dt = Math.min(now - last, 0.1);
     last = now;
-    if (!visible || document.hidden || pieces.length === 0) {
+    if (!visible || document.hidden || parts.length === 0) {
         // Don't let the cycle jump ahead while nobody watches.
         cycleStart += dt;
         return;
     }
-    const whole = updateCycle(now);
-    updateLook(whole, dt);
+    const turn = reduceMotion ? 0
+        : (now - cycleStart - assembleEnd - WAKE * 0.5) / cycleEnd * turnsPerCycle * Math.PI * 2;
+    pivot.rotation.set(TILT, turn, 0);
+    pivot.updateMatrixWorld(true);
+    const awake = updateCycle(now);
+    pivot.updateMatrixWorld(true);
+    poseFace(now - cycleStart, awake, dt);
     renderer.render(scene, camera);
 }
 
@@ -288,10 +250,9 @@ animate();
 window.addEventListener('resize', resize);
 window.addEventListener('pointermove', (e) => {
     const r = container.getBoundingClientRect();
-    // Relative to the head, clamped so far-away cursors don't overturn it.
-    const x = (e.clientX - (r.left + r.width / 2)) / (window.innerWidth / 2);
-    const y = (e.clientY - (r.top + r.height / 2)) / (window.innerHeight / 2);
-    pointer.set(THREE.MathUtils.clamp(x, -1, 1), THREE.MathUtils.clamp(y, -1, 1));
+    const x = (e.clientX - (r.left + r.width / 2)) / (r.width / 2);
+    const y = (e.clientY - (r.top + r.height / 2)) / (r.height / 2);
+    pointer.set(THREE.MathUtils.clamp(x, -3, 3), THREE.MathUtils.clamp(y, -3, 3));
 });
 // A click on the whole head takes it apart early.
 container.addEventListener('click', () => { skipHold = true; });
